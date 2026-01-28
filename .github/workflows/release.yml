@@ -111,10 +111,36 @@ jobs:
       - name: Prepare downloaded artifacts
         shell: bash
         run: |
+          set -euo pipefail
+          
+          # 创建目标目录
           mkdir -p dist src/typings
-          cp -R artifacts-temp/frontend-dist/* dist/ || cp -R artifacts-temp/frontend-dist/. dist/
-          cp -R artifacts-temp/components-typings/src/typings/. src/typings/
+          
+          # 1. 处理前端产物 (dist)
+          # 检查 artifacts-temp/frontend-dist 目录下是否有内容
+          if [ -d "artifacts-temp/frontend-dist" ]; then
+            echo "Moving frontend assets..."
+            # 使用 cp -a 保持属性，并处理可能存在的嵌套目录
+            cp -a artifacts-temp/frontend-dist/. dist/
+          fi
+          
+          # 2. 处理类型定义文件 (components-typings)
+          # 注意：download-artifact 会把上传的文件直接放在目标目录下，
+          # 除非上传时带了层级。
+          echo "Moving typings..."
+          if [ -d "artifacts-temp/components-typings" ]; then
+            # 查找所有 .d.ts 文件并移动到 src/typings
+            find artifacts-temp/components-typings -name "*.d.ts" -exec cp {} src/typings/ \;
+          fi
+          
+          # 清理临时目录
           rm -rf artifacts-temp
+          
+          # 验证结果
+          echo "Contents of dist:"
+          ls -F dist | head -n 5
+          echo "Contents of src/typings:"
+          ls -F src/typings/
 
       - name: install dependencies (Ubuntu/Android runner)
         if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-latest'
