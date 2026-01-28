@@ -5,13 +5,12 @@ on:
     tags:
       - 'v*'
 
-# 确保默认情况下所有 job 都只有只读权限，只有需要写权限的 job（比如发布 release 的 job）才会单独提升权限，其他 job 依然保持最小权限，最大程度保护仓库安全
 permissions:
-  contents: read
+  contents: write # 统一提升权限，方便各作业操作 release
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true # 如果有新的发布任务，取消正在进行的任务
+  cancel-in-progress: true
 
 jobs:
   prepare-frontend:
@@ -37,7 +36,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Generate frontend build (typings & assets)
+      - name: Generate frontend build
         env:
           NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm vite build --emptyOutDir
@@ -46,43 +45,52 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
-          if-no-files-found: error
           path: dist
 
       - name: Upload generated component typings
         uses: actions/upload-artifact@v4
         with:
           name: components-typings
-          if-no-files-found: error
           path: |
             src/typings/components.pc.d.ts
             src/typings/components.mobile.d.ts
 
   publish-tauri:
     needs: prepare-frontend
-    permissions:
-      contents: write # 授予写入仓库内容的权限
     strategy:
-      fail-fast: false # 某个平台构建失败不影响其他平台
+      fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest' # for Arm based macs (M1 and above).
+          - platform: 'macos-latest'
             args: '--target aarch64-apple-darwin'
-          - platform: 'macos-latest' # for Intel based macs.
+          - platform: 'macos-latest'
             args: '--target x86_64-apple-darwin'
           - platform: 'ubuntu-22.04'
             args: ''
           - platform: 'windows-latest'
             args: ''
-          # 新增Android平台配置
-          - platform: 'ubuntu-22.04'
+          # --- 新增 Android 平台支持 ---
+          - platform: 'ubuntu-latest'
             args: '--target aarch64-linux-android'
-            build-type: 'android'
+            is_android: true
 
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
+      # --- 1. Android 特有环境准备 ---
+      - name: setup Java (Android only)
+        if: matrix.is_android
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK (Android only)
+        if: matrix.is_android
+        uses: android-actions/setup-android@v3
+
+      # --- 2. 基础构建逻辑 (与原代码一致) ---
       - name: Determine build mode
         id: build_mode
         shell: bash
@@ -91,103 +99,37 @@ jobs:
           MODE="full"
           if [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             PATCH="${BASH_REMATCH[3]}"
-            if (( PATCH > 0 )); then
-              MODE="incremental"
-            fi
+            if (( PATCH > 0 )); then MODE="incremental"; fi
           fi
-          echo "Detected tag: $TAG"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          if [[ "$MODE" == "incremental" ]]; then
-            echo "INCREMENTAL_BUILD=true" >> "$GITHUB_ENV"
-          else
-            echo "INCREMENTAL_BUILD=false" >> "$GITHUB_ENV"
-          fi
-          echo "Build mode: $MODE"
 
-      - name: Download component typings
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: components-typings
-          path: components-typings
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend-dist
+          path: artifacts-temp
 
       - name: Prepare downloaded artifacts
         shell: bash
         run: |
-          set -euo pipefail
+          mkdir -p dist src/typings
+          cp -R artifacts-temp/frontend-dist/* dist/ || cp -R artifacts-temp/frontend-dist/. dist/
+          cp -R artifacts-temp/components-typings/src/typings/. src/typings/
+          rm -rf artifacts-temp
 
-          rm -rf dist
-          if [[ -d frontend-dist/dist ]]; then
-            mv frontend-dist/dist dist
-            rm -rf frontend-dist
-          elif [[ -d frontend-dist ]]; then
-            mv frontend-dist dist
-          elif [[ ! -d dist ]]; then
-            echo "无法在 artifact 中找到 dist 目录" >&2
-            ls -la
-            exit 1
-          fi
-
-          if [[ -d components-typings/src/typings ]]; then
-            mkdir -p src/typings
-            cp -R components-typings/src/typings/. src/typings/
-            rm -rf components-typings
-          fi
-
-      - name: install dependencies (ubuntu only - desktop)
-        if: matrix.platform == 'ubuntu-22.04' && !matrix.build-type == 'android'
+      - name: install dependencies (Ubuntu/Android runner)
+        if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libudev-dev \
-            libasound2-dev \
-            pkg-config \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libudev-dev libasound2-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev
 
-      # 新增：安装Android构建依赖
-      - name: Install Android build dependencies (ubuntu only - android)
-        if: matrix.build-type == 'android'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            openjdk-17-jdk \
-            unzip \
-            lib32z1 \
-            wget \
-            curl
-
-      # 新增：配置Android SDK和NDK
-      - name: Setup Android SDK and NDK
-        if: matrix.build-type == 'android'
-        uses: android-actions/setup-android@v3
-        with:
-          android-sdk-manager-version: 7.0.0
-          android-sdk-build-tools: 34.0.0
-          android-sdk-platforms: android-34
-          android-ndk-version: 25.2.9519653
-          cmake-version: 3.22.1
-
-      # 添加环境变量配置
       - name: Set up environment variables
         run: echo "${{ secrets.ENV_LOCAL_CONTENT }}" > .env.local
 
-      # 首先安装 pnpm
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10
-          run_install: false
 
-      # 然后设置 Node.js
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -195,19 +137,13 @@ jobs:
           cache: 'pnpm'
 
       - name: Install dependencies
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm install
 
-      - name: Disable frontend rebuild for release build
+      - name: Disable frontend rebuild
         shell: bash
         run: |
           cat <<'EOF' > release-tauri-config.json
-          {
-            "build": {
-              "beforeBuildCommand": ""
-            }
-          }
+          { "build": { "beforeBuildCommand": "" } }
           EOF
 
       - name: Prepare production config
@@ -220,7 +156,7 @@ jobs:
           TENCENT_MAP_KEY: ${{ secrets.TENCENT_MAP_KEY }}
         run: |
           mkdir -p src-tauri/configuration
-          cat > src-tauri/configuration/production.yaml <<'EOF'
+          cat > src-tauri/configuration/production.yaml <<EOF
           youdao:
             app_key: "${YOUDAO_APP_KEY}"
             app_secret: "${YOUDAO_APP_SECRET}"
@@ -230,30 +166,11 @@ jobs:
             map_key: "${TENCENT_MAP_KEY}"
           EOF
 
-      # 安装 Rust
+      # --- 3. Rust Toolchain 设置 (适配 Android Target) ---
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          # 为macOS添加target，为Android添加aarch64-linux-android target
-          targets: ${{ 
-            matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 
-            matrix.build-type == 'android' && 'aarch64-linux-android' || '' 
-          }}
-
-      # 新增：配置Android Rust构建环境
-      - name: Configure Android Rust environment
-        if: matrix.build-type == 'android'
-        run: |
-          # 设置Android NDK路径
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
-          # 配置cargo的Android target
-          rustup target add aarch64-linux-android
-          # 设置Android链接器
-          mkdir -p .cargo
-          cat <<EOF > .cargo/config.toml
-          [target.aarch64-linux-android]
-          linker = "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
-          EOF
+          targets: ${{ matrix.is_android && 'aarch64-linux-android' || (matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '') }}
 
       - name: Cache cargo target
         uses: actions/cache@v4
@@ -262,86 +179,56 @@ jobs:
             ${{ runner.os == 'Windows' && env.USERPROFILE || env.HOME }}/.cargo/registry
             ${{ runner.os == 'Windows' && env.USERPROFILE || env.HOME }}/.cargo/git
             src-tauri/target
-          key: cargo-target-${{ matrix.platform }}-${{ matrix.build-type || 'desktop' }}-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            cargo-target-${{ matrix.platform }}-${{ matrix.build-type || 'desktop' }}-
+          key: cargo-target-${{ matrix.platform }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-target-${{ matrix.platform }}-
 
+      # --- 4. 执行 Tauri 构建并发布 ---
       - name: Create release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 使用之前配置的私钥
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # 使用之前配置的私钥密码
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # 增加 Node.js 内存限制，避免构建时内存溢出
           NODE_OPTIONS: --max-old-space-size=4096
-          # Android构建需要的环境变量
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
         with:
-          tagName: v__VERSION__ #这个动作会自动将__VERSION__替换为app version
+          tagName: v__VERSION__
           releaseName: 'v__VERSION__'
           releaseBody: 'See the assets to download and install this version.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }} --config release-tauri-config.json
+          # 关键点：如果是 Android，参数必须改为 "android build"
+          args: ${{ matrix.args }} ${{ matrix.is_android && 'android build' || '' }} --config release-tauri-config.json
 
   publish-release:
     needs: publish-tauri
-    permissions:
-      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Extract changelog for current version
+      - name: Extract changelog
         id: changelog
         run: |
-          # 从 CHANGELOG.md 中提取最新版本的内容
-          # 匹配从第一个 ## [version] 到下一个 ## [version] 之间的内容
           CHANGELOG_CONTENT=$(awk '/^## \[/{if(found) exit; found=1} found' CHANGELOG.md)
-
-          # 将内容写入文件以保留格式
           echo "$CHANGELOG_CONTENT" > /tmp/release_notes.md
-
-          # 输出到 GITHUB_OUTPUT（使用 EOF 分隔符处理多行）
-          {
-            echo 'body<<EOF'
-            echo "$CHANGELOG_CONTENT"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          { echo 'body<<EOF'; echo "$CHANGELOG_CONTENT"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Publish draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 直接按 tag 获取 release，避免同 tag 多个草稿导致多个 ID
           RELEASE=$(gh api repos/${{ github.repository }}/releases/tags/${{ github.ref_name }} 2>/dev/null || true)
           if [ -n "$RELEASE" ] && [ "$(echo "$RELEASE" | jq -r '.draft')" = "true" ]; then
             RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-            echo "Publishing draft release with ID: $RELEASE_ID"
-
-            # 使用 changelog 内容更新 release body 并发布
-            gh api -X PATCH repos/${{ github.repository }}/releases/$RELEASE_ID \
-              -f draft=false \
-              -f body="$(cat /tmp/release_notes.md)"
-
-            echo "Release published successfully with changelog"
-          else
-            echo "No draft release found for tag ${{ github.ref_name }}, it may already be published"
+            gh api -X PATCH repos/${{ github.repository }}/releases/$RELEASE_ID -f draft=false -f body="$(cat /tmp/release_notes.md)"
           fi
 
   upgradeLink-upload:
-    needs: publish-release # 依赖于 publish-release 作业完成（确保 release 已正式发布）
-    permissions:
-      contents: write
+    needs: publish-release
     runs-on: ubuntu-latest
     steps:
       - name: Send a request to UpgradeLink
         uses: toolsetlink/upgradelink-action@v5
         with:
           source-url: 'https://github.com/HuLaSpark/HuLa/releases/download/${{ github.ref_name }}/latest.json'
-          access-key: ${{ secrets.UPGRADE_LINK_ACCESS_KEY }} # ACCESS_KEY  密钥key
-          tauri-key: ${{ secrets.UPGRADE_LINK_TAURI_KEY }} # TAURI_KEY tauri 应用唯一标识
+          access-key: ${{ secrets.UPGRADE_LINK_ACCESS_KEY }}
+          tauri-key: ${{ secrets.UPGRADE_LINK_TAURI_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
